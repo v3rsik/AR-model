@@ -14,23 +14,28 @@
       background: #ffffff;
       display: flex;
       justify-content: center;
-      align-items: flex-start;
-      min-height: 100vh;
-      flex-direction: column;
+      align-items: center;
+      height: 100vh;
     }
-
     model-viewer {
-      width: 100%;
-      height: 80vh;
-      margin-top: 20px;
-      display: block;
-    }
+  width: 100%;
+  height: 80vh; /* or 70vh */
+  margin-top: 20px;
+}
 
-    /* Move AR button upward */
-    model-viewer::part(ar-button) {
-      bottom: 40px;   /* adjust this value to move it higher or lower */
-      right: 20px;
-      transform: scale(1.2); /* optional: make button larger */
-    }
   </style>
 </head>
+
+<body>
+  <model-viewer
+    src="ROV.glb"
+    ios-src="ROV.usdz"
+    ar
+    ar-modes="quick-look webxr scene-viewer"
+    camera-controls
+    auto-rotate
+    shadow-intensity="1"
+    environment-image="neutral">
+  </model-viewer>
+</body>
+</html>
