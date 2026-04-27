@@ -1,0 +1,219 @@
+// VIN DECODER
+#include <Arduino.h>
+#include "driver/twai.h"
+
+// =======================
+// CAN / OBD DEFINITIONS
+// =======================
+#define CAN_TX_GPIO GPIO_NUM_5
+#define CAN_RX_GPIO GPIO_NUM_4
+
+#define OBD_REQ_ID  0x7DF
+#define OBD_RESP_ID 0x7E8
+
+// =======================
+// DATA TYPES
+// =======================
+enum oem_t { OEM_UNKNOWN, OEM_BMW };
+enum chassis_t { CH_UNKNOWN, CH_F30, CH_F32 };
+enum engine_t { ENG_UNKNOWN, ENG_N20, ENG_N55, ENG_B58 };
+
+// =======================
+// FLASH-OPTIMIZED TABLES
+// =======================
+#define WMI(a,b,c) ((a<<16)|(b<<8)|(c))
+
+struct wmi_entry_t {
+  uint32_t wmi;
+  oem_t oem;
+};
+
+const wmi_entry_t WMI_TABLE[] PROGMEM = {
+  { WMI('W','B','A'), OEM_BMW },
+  { WMI('W','B','S'), OEM_BMW },
+};
+
+struct year_entry_t {
+  char code;
+  uint16_t year;
+};
+
+const year_entry_t YEAR_TABLE[] PROGMEM = {
+  {'D',2013}, {'E',2014}, {'F',2015},
+  {'G',2016}, {'H',2017}, {'J',2018}
+};
+
+struct chassis_entry_t {
+  char vin4;
+  chassis_t chassis;
+};
+
+const chassis_entry_t CHASSIS_TABLE[] PROGMEM = {
+  {'3', CH_F30},
+  {'4', CH_F32},
+};
+
+// =======================
+// GLOBAL STATE
+// =======================
+char vin[18] = {0};
+bool vin_valid = false;
+uint8_t fuel_pid = 0xFF;
+
+// =======================
+// CAN HELPERS
+// =======================
+void can_send(uint32_t id, const uint8_t *data, uint8_t len) {
+  twai_message_t msg = {};
+  msg.identifier = id;
+  msg.flags = TWAI_MSG_FLAG_EXTD == 0;
+  msg.data_length_code = len;
+  memcpy(msg.data, data, len);
+  twai_transmit(&msg, pdMS_TO_TICKS(100));
+}
+
+bool can_receive(twai_message_t &msg, uint32_t timeout_ms) {
+  return twai_receive(&msg, pdMS_TO_TICKS(timeout_ms)) == ESP_OK;
+}
+
+// =======================
+// ISO-TP VIN READ
+// =======================
+bool read_vin() {
+  uint8_t req[] = {0x02, 0x09, 0x02, 0,0,0,0,0};
+  can_send(OBD_REQ_ID, req, 8);
+
+  twai_message_t rx;
+  uint8_t vin_idx = 0;
+  bool got_ff = false;
+
+  while (can_receive(rx, 500)) {
+    if (rx.identifier != OBD_RESP_ID) continue;
+
+    uint8_t pci = rx.data[0];
+
+    // First Frame
+    if ((pci & 0xF0) == 0x10) {
+      got_ff = true;
+      // Send Flow Control
+      uint8_t fc[] = {0x30,0,0,0,0,0,0,0};
+      can_send(OBD_RESP_ID, fc, 8);
+
+      // Skip 49 02 01
+      for (int i=5; i<8; i++)
+        vin[vin_idx++] = rx.data[i];
+    }
+    // Consecutive Frames
+    else if (got_ff && (pci & 0xF0) == 0x20) {
+      for (int i=1; i<8 && vin_idx < 17; i++)
+        vin[vin_idx++] = rx.data[i];
+    }
+
+    if (vin_idx >= 17) {
+      vin[17] = 0;
+      return true;
+    }
+  }
+  return false;
+}
+
+// =======================
+// FUEL TYPE (PID 01 51)
+// =======================
+bool read_fuel_type() {
+  uint8_t req[] = {0x02, 0x01, 0x51, 0,0,0,0,0};
+  can_send(OBD_REQ_ID, req, 8);
+
+  twai_message_t rx;
+  if (can_receive(rx, 500) && rx.identifier == OBD_RESP_ID) {
+    fuel_pid = rx.data[3];
+    return true;
+  }
+  return false;
+}
+
+// =======================
+// VIN DECODING
+// =======================
+oem_t decode_oem() {
+  uint32_t wmi = WMI(vin[0],vin[1],vin[2]);
+  for (auto &e : WMI_TABLE)
+    if (e.wmi == wmi) return e.oem;
+  return OEM_UNKNOWN;
+}
+
+uint16_t decode_year() {
+  for (auto &e : YEAR_TABLE)
+    if (e.code == vin[9]) return e.year;
+  return 0;
+}
+
+chassis_t decode_chassis() {
+  for (auto &e : CHASSIS_TABLE)
+    if (e.vin4 == vin[3]) return e.chassis;
+  return CH_UNKNOWN;
+}
+
+engine_t infer_engine(chassis_t ch, uint16_t year) {
+  if (ch == CH_F32) {
+    if (year >= 2013 && year <= 2015) return ENG_N55;
+    if (year >= 2016) return ENG_B58;
+  }
+  return ENG_UNKNOWN;
+}
+
+// =======================
+// STRING HELPERS
+// =======================
+const char* engine_str(engine_t e) {
+  if (e == ENG_N55) return "N55";
+  if (e == ENG_B58) return "B58";
+  return "Unknown";
+}
+
+const char* fuel_str() {
+  if (fuel_pid == 0x01) return "Petrol";
+  if (fuel_pid == 0x04) return "Diesel";
+  return "Unknown";
+}
+
+// =======================
+// SETUP / LOOP
+// =======================
+void setup() {
+  Serial.begin(115200);
+
+  twai_general_config_t g_config =
+    TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_GPIO, CAN_RX_GPIO, TWAI_MODE_NORMAL);
+  twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
+  twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+  twai_driver_install(&g_config, &t_config, &f_config);
+  twai_start();
+
+  vin_valid = read_vin();
+  read_fuel_type();
+
+  Serial.println("Vehicle Info");
+
+  if (!vin_valid) {
+    Serial.println("VIN: unavailable");
+    Serial.println("Model: unknown");
+    Serial.println("Engine: unknown");
+    Serial.println("Fuel: unknown");
+    return;
+  }
+
+  uint16_t year = decode_year();
+  chassis_t ch = decode_chassis();
+  engine_t eng = infer_engine(ch, year);
+
+  Serial.print("VIN: "); Serial.println(vin);
+  Serial.print("Model: 435i F32 ("); Serial.print(year); Serial.println(")");
+  Serial.print("Engine: "); Serial.println(engine_str(eng));
+  Serial.print("Fuel: "); Serial.println(fuel_str());
+}
+
+void loop() {
+  // Static screen → nothing to do
+}
